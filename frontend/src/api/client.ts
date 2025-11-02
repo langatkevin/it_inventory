@@ -2,13 +2,17 @@ import axios from 'axios';
 
 import type {
   Asset,
+  AssetCreateRequest,
   AssetListResponse,
   AssetTransitionRequest,
+  AssetModel,
   AssetType,
   AssignmentWithAsset,
   DashboardSummary,
   OrganisationUnit,
   Person,
+  PersonOffboardingRequest,
+  PersonOffboardingResult,
 } from './types';
 
 const baseURL = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000/api';
@@ -36,6 +40,9 @@ export const inventoryApi = {
   listAssetTypes() {
     return api.get<AssetType[]>('/metadata/asset-types').then((res) => res.data);
   },
+  listAssetModels() {
+    return api.get<AssetModel[]>('/metadata/asset-models').then((res) => res.data);
+  },
   listPeople() {
     return api.get<Person[]>('/people').then((res) => res.data);
   },
@@ -46,6 +53,14 @@ export const inventoryApi = {
   },
   getDashboardSummary() {
     return api.get<DashboardSummary>('/dashboard/summary').then((res) => res.data);
+  },
+  offboardPerson(personId: string, payload: PersonOffboardingRequest) {
+    return api
+      .post<PersonOffboardingResult>(`/people/${personId}/offboard`, payload)
+      .then((res) => res.data);
+  },
+  createAsset(payload: AssetCreateRequest) {
+    return api.post<Asset>('/assets', payload).then((res) => res.data);
   },
 };
 

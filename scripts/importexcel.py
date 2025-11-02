@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,7 @@ from app.models import (
     OrganisationUnit,
     OperationState,
     Person,
+    Assignment,
     RelationType,
     AssetRelationship,
     EventAction,
@@ -120,28 +122,65 @@ def add_event(session: Session, asset: Asset, notes: str) -> None:
     )
     session.add(event)
 
+def _find_asset(session: Session, asset_tag: Optional[str], serial_number: Optional[str]) -> Optional[Asset]:
+    if asset_tag:
+        asset = session.query(Asset).filter(Asset.asset_tag == asset_tag.strip()).one_or_none()
+        if asset:
+            return asset
+    if serial_number:
+        asset = session.query(Asset).filter(Asset.serial_number == serial_number.strip()).one_or_none()
+        if asset:
+            return asset
+    return None
+
+def _ensure_assignment(
+    session: Session,
+    asset: Asset,
+    person: Person,
+    *,
+    primary_device: bool,
+    notes: Optional[str] = None,
+) -> None:
+    existing_assignment = (
+        session.query(Assignment)
+        .filter(Assignment.asset_id == asset.id, Assignment.end_date.is_(None))
+        .one_or_none()
+    )
+    if existing_assignment:
+        if existing_assignment.person_id == person.id:
+            return
+        existing_assignment.end_date = datetime.utcnow()
+    assignment = Assignment(
+        asset_id=asset.id,
+        person_id=person.id,
+        start_date=datetime.utcnow(),
+        primary_device=primary_device,
+        notes=notes,
+    )
+    session.add(assignment)
+
 def ingest_servers(session: Session, df: pd.DataFrame) -> None:
     for _, row in df.iterrows():
         if row.isna().all():
             continue
-        model = upsert_asset_model(session, "Server", str(row["Asset model"]))
         department = upsert_department(session, row.get("Department"), category=OrganisationCategory.department)
-        asset = Asset(
-            asset_model_id=model.id,
-            asset_tag=row.get("Asset name"),
-            serial_number=row.get("Serial Number"),
-            status=normalise_status(row.get("Operation"), default=AssetStatus.active),
-            operation_state=OperationState.normal,
-            purchase_date=pd.to_datetime(row.get("Date of Purchase"), errors="coerce").date()
-            if row.get("Date of Purchase")
-            else None,
-            supplier=row.get("Supplier"),
-            description=row.get("Description"),
-            location_id=department.id if department else None,
+        asset = _create_asset(
+            session,
+            "Server",
+            row,
+            default_status=AssetStatus.active,
+            default_location=department,
+            description_fields=["Description"],
         )
-        session.add(asset)
-        session.flush()
-        add_event(session, asset, "Imported from Servers sheet")
+        purchase_date = (
+            pd.to_datetime(row.get("Date of Purchase"), errors="coerce").date()
+            if row.get("Date of Purchase")
+            else None
+        )
+        if purchase_date:
+            asset.purchase_date = purchase_date
+        if row.get("Supplier"):
+            asset.supplier = row.get("Supplier")
 
 def _create_asset(session: Session, type_name: str, row: dict, *, default_status: AssetStatus, default_location: Optional[OrganisationUnit], description_fields: list[str]) -> Asset:
     model_name = str(row.get("Asset model") or type_name)
@@ -149,25 +188,54 @@ def _create_asset(session: Session, type_name: str, row: dict, *, default_status
     description = row.get("Description")
     if not description:
         description = " | ".join(str(row.get(field)) for field in description_fields if row.get(field))
-    asset = Asset(
-        asset_model_id=model.id,
-        asset_tag=row.get("Asset name"),
-        serial_number=row.get("Serial Number"),
-        status=normalise_status(row.get("Operation"), default=default_status),
-        operation_state=OperationState.normal,
-        supplier=row.get("Supplier"),
-        description=description,
-        location_id=default_location.id if default_location else None,
-    )
-    session.add(asset)
-    session.flush()
-    add_event(session, asset, f"Imported {type_name}")
+    status = normalise_status(row.get("Operation"), default=default_status)
+    location = default_location
+    if not location and status == AssetStatus.active:
+        location = upsert_department(
+            session,
+            "Unassigned Pool",
+            category=OrganisationCategory.warehouse,
+        )
+    asset_tag = row.get("Asset name")
+    serial_number = row.get("Serial Number")
+    asset = _find_asset(session, asset_tag, serial_number)
+    created = False
+    if not asset:
+        asset = Asset(
+            asset_model_id=model.id,
+            asset_tag=asset_tag,
+            serial_number=serial_number,
+            status=status,
+            operation_state=OperationState.normal,
+            supplier=row.get("Supplier"),
+            description=description,
+            location_id=location.id if location else None,
+        )
+        session.add(asset)
+        session.flush()
+        created = True
+    else:
+        asset.asset_model_id = model.id
+        if asset_tag and asset.asset_tag != asset_tag:
+            asset.asset_tag = asset_tag
+        if serial_number and asset.serial_number != serial_number:
+            asset.serial_number = serial_number
+        asset.status = status
+        asset.operation_state = OperationState.normal
+        if row.get("Supplier"):
+            asset.supplier = row.get("Supplier")
+        if description:
+            asset.description = description
+        if location and asset.location_id != location.id:
+            asset.location_id = location.id
+    if created:
+        add_event(session, asset, f"Imported {type_name}")
     return asset
 
-def _attach_monitor(session: Session, computer: Asset, monitor_tag: Optional[str]) -> None:
+def _attach_monitor(session: Session, computer: Asset, monitor_tag: Optional[str], person: Optional[Person]) -> None:
     if not monitor_tag or str(monitor_tag).strip() == "":
         return
-    monitor = session.query(Asset).filter(Asset.asset_tag == monitor_tag.strip()).one_or_none()
+    monitor = _find_asset(session, monitor_tag.strip(), None)
     if not monitor:
         model = upsert_asset_model(session, "Monitor", "Generic Monitor")
         monitor = Asset(
@@ -175,16 +243,41 @@ def _attach_monitor(session: Session, computer: Asset, monitor_tag: Optional[str
             asset_tag=monitor_tag.strip(),
             status=AssetStatus.active,
             operation_state=OperationState.normal,
+            location_id=computer.location_id,
         )
         session.add(monitor)
         session.flush()
         add_event(session, monitor, "Created while linking monitor to computer")
-    relation = AssetRelationship(
-        parent_asset_id=computer.id,
-        child_asset_id=monitor.id,
-        relation_type=RelationType.peripheral_of,
+    else:
+        # keep monitor aligned with the computer once it's linked
+        if computer.location_id and monitor.location_id != computer.location_id:
+            monitor.location_id = computer.location_id
+        if monitor.status != AssetStatus.active:
+            monitor.status = AssetStatus.active
+    if person:
+        _ensure_assignment(
+            session,
+            monitor,
+            person,
+            primary_device=False,
+            notes=f"Imported with {computer.asset_tag or 'computer'}",
+        )
+    existing_relation = (
+        session.query(AssetRelationship)
+        .filter(
+            AssetRelationship.parent_asset_id == computer.id,
+            AssetRelationship.child_asset_id == monitor.id,
+            AssetRelationship.relation_type == RelationType.peripheral_of,
+        )
+        .one_or_none()
     )
-    session.add(relation)
+    if not existing_relation:
+        relation = AssetRelationship(
+            parent_asset_id=computer.id,
+            child_asset_id=monitor.id,
+            relation_type=RelationType.peripheral_of,
+        )
+        session.add(relation)
 
 def ingest_computers(session: Session, df: pd.DataFrame, *, default_status: AssetStatus) -> None:
     for _, row in df.iterrows():
@@ -210,9 +303,16 @@ def ingest_computers(session: Session, df: pd.DataFrame, *, default_status: Asse
         )
         if person:
             asset.status = AssetStatus.active
+            _ensure_assignment(
+                session,
+                asset,
+                person,
+                primary_device=True,
+                notes="Imported from Computers sheet",
+            )
         session.flush()
         for column in ("Monitor 1", "Monitor 2", "Monitor 3"):
-            _attach_monitor(session, asset, row.get(column))
+            _attach_monitor(session, asset, row.get(column), person)
 
 def ingest_network_devices(session: Session, df: pd.DataFrame) -> None:
     for _, row in df.iterrows():

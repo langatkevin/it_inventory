@@ -36,9 +36,9 @@ class TransitionService:
         elif action == "return":
             self._return_to_store(asset, payload.target_location_id, payload.notes)
         elif action == "repair":
-            self._mark_repair(asset, payload.notes)
+            self._mark_repair(asset, payload.notes, payload.target_location_id)
         elif action == "retire":
-            self._retire(asset, payload.notes)
+            self._retire(asset, payload.notes, payload.target_location_id)
         elif action == "move":
             ensure(
                 payload.target_location_id is not None,
@@ -55,6 +55,56 @@ class TransitionService:
         self.db.refresh(asset)
         return asset
 
+    def _end_open_assignments(self, asset: models.Asset, audit_note: str | None = None) -> None:
+        note = audit_note.strip() if audit_note else None
+        for assignment in asset.assignments:
+            if assignment.end_date is None:
+                assignment.end_date = datetime.utcnow()
+                if note:
+                    assignment.notes = (assignment.notes or "") + f"\n{note}"
+                self._log_event(
+                    asset,
+                    models.EventAction.assignment_ended,
+                    notes=f"Closed assignment {assignment.id}",
+                )
+
+    def _cascade_peripheral_status(
+        self,
+        asset: models.Asset,
+        new_status: models.AssetStatus,
+        target_location_id: str | None,
+        status_note: str,
+    ) -> None:
+        for relationship in asset.relationships:
+            child = relationship.child
+            if not child:
+                continue
+            previous_status = child.status
+            previous_location = child.location_id
+            child.status = new_status
+            if target_location_id:
+                child.location_id = target_location_id
+            if new_status == models.AssetStatus.retired:
+                child.operation_state = models.OperationState.decommissioned
+            self._log_event(
+                child,
+                models.EventAction.status_changed,
+                from_status=previous_status,
+                to_status=new_status,
+                notes=status_note,
+            )
+            if (
+                target_location_id
+                and child.location_id != previous_location
+                and child.location_id is not None
+            ):
+                self._log_event(
+                    child,
+                    models.EventAction.location_changed,
+                    from_location=previous_location,
+                    to_location=child.location_id,
+                )
+
     def _deploy(
         self,
         asset: models.Asset,
@@ -64,17 +114,7 @@ class TransitionService:
         previous_status = asset.status
         previous_location = asset.location_id
 
-        open_assignments = [
-            assignment for assignment in asset.assignments if assignment.end_date is None
-        ]
-        for assignment in open_assignments:
-            assignment.end_date = datetime.utcnow()
-            assignment.notes = (assignment.notes or "") + "\nAuto-closed before new deployment."
-            self._log_event(
-                asset,
-                models.EventAction.assignment_ended,
-                notes=f"Closed assignment {assignment.id}",
-            )
+        self._end_open_assignments(asset, "Auto-closed before new deployment.")
 
         assignment = models.Assignment(
             asset_id=asset.id,
@@ -123,15 +163,7 @@ class TransitionService:
         previous_status = asset.status
         previous_location = asset.location_id
 
-        for assignment in asset.assignments:
-            if assignment.end_date is None:
-                assignment.end_date = datetime.utcnow()
-                assignment.notes = (assignment.notes or "") + "\nAuto-closed on return."
-                self._log_event(
-                    asset,
-                    models.EventAction.assignment_ended,
-                    notes=f"Assignment {assignment.id} closed on return.",
-                )
+        self._end_open_assignments(asset, "Auto-closed on return.")
 
         asset.status = models.AssetStatus.spare
         if target_location_id:
@@ -168,9 +200,20 @@ class TransitionService:
                 to_location=asset.location_id,
             )
 
-    def _mark_repair(self, asset: models.Asset, notes: str | None) -> None:
+    def _mark_repair(
+        self,
+        asset: models.Asset,
+        notes: str | None,
+        target_location_id: str | None,
+    ) -> None:
         previous_status = asset.status
+        previous_location = asset.location_id
+
+        self._end_open_assignments(asset, "Auto-closed during repair transition.")
+
         asset.status = models.AssetStatus.repair
+        if target_location_id:
+            asset.location_id = target_location_id
         if notes:
             asset.notes = (asset.notes or "") + f"\n{notes}"
         self._log_event(
@@ -179,11 +222,36 @@ class TransitionService:
             from_status=previous_status,
             to_status=models.AssetStatus.repair,
         )
+        if target_location_id and asset.location_id != previous_location:
+            self._log_event(
+                asset,
+                models.EventAction.location_changed,
+                from_location=previous_location,
+                to_location=asset.location_id,
+            )
 
-    def _retire(self, asset: models.Asset, notes: str | None) -> None:
+        self._cascade_peripheral_status(
+            asset,
+            models.AssetStatus.repair,
+            target_location_id,
+            "Peripheral sent for repair with primary asset.",
+        )
+
+    def _retire(
+        self,
+        asset: models.Asset,
+        notes: str | None,
+        target_location_id: str | None,
+    ) -> None:
         previous_status = asset.status
+        previous_location = asset.location_id
+
+        self._end_open_assignments(asset, "Auto-closed during retirement transition.")
+
         asset.status = models.AssetStatus.retired
         asset.operation_state = models.OperationState.decommissioned
+        if target_location_id:
+            asset.location_id = target_location_id
         if notes:
             asset.notes = (asset.notes or "") + f"\n{notes}"
         self._log_event(
@@ -191,6 +259,20 @@ class TransitionService:
             models.EventAction.status_changed,
             from_status=previous_status,
             to_status=models.AssetStatus.retired,
+        )
+        if target_location_id and asset.location_id != previous_location:
+            self._log_event(
+                asset,
+                models.EventAction.location_changed,
+                from_location=previous_location,
+                to_location=asset.location_id,
+            )
+
+        self._cascade_peripheral_status(
+            asset,
+            models.AssetStatus.retired,
+            target_location_id,
+            "Peripheral retired with primary asset.",
         )
 
     def _move(self, asset: models.Asset, location_id: str, notes: str | None) -> None:

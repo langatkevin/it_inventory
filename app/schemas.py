@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,6 +63,29 @@ class PersonRead(PersonBase):
     id: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OffboardDisposition(str, Enum):
+    spare = "spare"
+    repair = "repair"
+    retire = "retire"
+
+
+class OffboardAssetPlan(BaseModel):
+    asset_id: str
+    disposition: OffboardDisposition
+    target_location_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class PersonOffboardingRequest(BaseModel):
+    disposition: OffboardDisposition = OffboardDisposition.spare
+    target_location_id: Optional[str] = None
+    notes: Optional[str] = None
+    overrides: list[OffboardAssetPlan] = Field(
+        default_factory=list,
+        description="Optional per-asset dispositions overriding the default handling.",
+    )
 
 
 class AssetTypeBase(BaseModel):
@@ -247,3 +271,7 @@ class AssetListResponse(BaseModel):
     total: int
     page: int
     size: int
+
+
+class PersonOffboardingResult(BaseModel):
+    processed_assets: list[AssetRead]

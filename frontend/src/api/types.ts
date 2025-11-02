@@ -108,6 +108,8 @@ export interface DashboardSummary {
   assets_by_department: Record<string, number>;
 }
 
+export type OffboardDisposition = 'spare' | 'repair' | 'retire';
+
 export interface AssetTransitionRequest {
   action: 'deploy' | 'return' | 'repair' | 'retire' | 'move';
   target_status?: AssetStatus;
@@ -124,4 +126,35 @@ export interface AssignmentPayload {
   primary_device?: boolean;
   notes?: string;
   monitors?: string[];
+}
+
+export interface OffboardAssetPlan {
+  asset_id: string;
+  disposition: OffboardDisposition;
+  target_location_id?: string;
+  notes?: string;
+}
+
+export interface PersonOffboardingRequest {
+  disposition: OffboardDisposition;
+  target_location_id?: string;
+  notes?: string;
+  overrides?: OffboardAssetPlan[];
+}
+
+export interface PersonOffboardingResult {
+  processed_assets: Asset[];
+}
+
+export interface AssetCreateRequest {
+  asset_tag?: string;
+  serial_number?: string;
+  asset_model_id: string;
+  status: AssetStatus;
+  operation_state?: OperationState;
+  purchase_date?: string;
+  supplier?: string;
+  description?: string;
+  location_id?: string;
+  notes?: string;
 }
